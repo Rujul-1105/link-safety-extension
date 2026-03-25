@@ -1,0 +1,1 @@
+{"root":["./src/background/index.ts","./src/content/index.ts","./src/options/main.tsx","./src/popup/App.tsx","./src/popup/main.tsx","./src/popup/components/HistoryTable.tsx","./src/popup/components/RiskGauge.tsx","./src/popup/components/SignalCard.tsx","./src/shared/store.ts","./src/shared/theme.ts","./src/shared/types.ts","./manifest.json"],"errors":true,"version":"5.9.3"}
