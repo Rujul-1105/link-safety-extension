@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // url      = env("DATABASE_URL")
+}
+
+model UserDevice {
+  id          String       @id @default(cuid())
+  tokenHash   String       @unique // SHA-256 of the JWT — never store raw token
+  createdAt   DateTime     @default(now())
+  lastSeenAt  DateTime     @default(now())
+  scanCount   Int          @default(0)
+  scanResults ScanResult[]
+
+  @@index([tokenHash])
+}
+
+model ScanResult {
+  id             String   @id @default(cuid())
+  urlHash        String // SHA-256 of the URL — privacy
+  url            String // full URL (remove in production if privacy matters)
+  score          Int
+  level          String // SAFE | LOW | MODERATE | HIGH | CRITICAL
+  recommendation String // allow | warn | block
+  mlScore        Float
+  signals        Json // ThreatSignal[] stored as JSON
+  fromCache      Boolean  @default(false)
+  scanDurationMs Int?
+  createdAt      DateTime @default(now())
+
+  device   UserDevice @relation(fields: [deviceId], references: [id])
+  deviceId String
+
+  @@index([urlHash])
+  @@index([createdAt])
+  @@index([score])
+}
+
+model FlaggedDomain {
+  id          String   @id @default(cuid())
+  domain      String   @unique
+  score       Int
+  reason      String
+  reportCount Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([domain])
+}
