@@ -1,114 +1,115 @@
-import { Response } from 'express'
-import { AuthRequest } from '../middleware/auth'
-import { scanUrl, hashUrl } from '../services/scan.service'
-import { prisma } from '../lib/prisma'
-import { logger } from '../lib/logger'
-import { ScanRequest } from '../types'
+import { Response } from "express";
+import { AuthRequest } from "../middleware/auth";
+import { scanUrl, hashUrl } from "../services/scan.service";
+import { prisma } from "../lib/prisma";
+import { logger } from "../lib/logger";
+import { redis, cacheGet, cacheSet, scanCacheKey } from "../lib/redis";
+import { scanQueue } from "../lib/queue";
+import { pushThreatResult } from "../lib/socket";
+import { ThreatReport, ScanRequest } from "../types";
+import jwt from "jsonwebtoken";
+
+// ─── POST /api/scan ───────────────────────────────────────────────────────────
 
 export async function handleScan(req: AuthRequest, res: Response): Promise<void> {
-    const { url, mlScore }: ScanRequest = req.body
+    const { url, mlScore }: ScanRequest = req.body;
 
-    // Validate input
-    if (!url || typeof url !== 'string') {
-        res.status(400).json({ error: 'url is required' })
-        return
+    if (!url || typeof url !== "string") {
+        res.status(400).json({ error: "url is required" });
+        return;
     }
 
     try {
-        new URL(url)
+        new URL(url);
     } catch {
-        res.status(400).json({ error: 'Invalid URL format' })
-        return
+        res.status(400).json({ error: "Invalid URL format" });
+        return;
     }
 
-    const urlHash = hashUrl(url)
+    const urlHash = hashUrl(url);
+    const cacheKey = scanCacheKey(urlHash);
 
     try {
-        // Check if we already have a recent result in the DB (last 24 hours)
-        const recent = await prisma.scanResult.findFirst({
+        // ── 1. Redis cache check (fastest path ~1ms) ──────────────────────────
+        const cached = await cacheGet<ThreatReport>(cacheKey);
+        if (cached) {
+            logger.debug(`Redis HIT: ${url}`);
+            await redis.incr("stats:cache_hits"); // ← add this line
+            res.json({ ...cached, fromCache: true });
+            return;
+        }
+        // ── 2. DB cache check (24h window) ────────────────────────────────────
+        const recentDB = await prisma.scanResult.findFirst({
             where: {
                 urlHash,
                 createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
             },
-            orderBy: { createdAt: 'desc' },
-        })
+            orderBy: { createdAt: "desc" },
+        });
 
-        if (recent) {
-            logger.debug(`DB cache hit for ${url}`)
-            res.json({
-                ...recent.signals as object,
-                url: recent.url,
-                score: recent.score,
-                level: recent.level,
-                recommendation: recent.recommendation,
-                mlScore: recent.mlScore,
-                signals: recent.signals,
-                cachedAt: recent.createdAt.getTime(),
-                fromCache: true,
-            })
-            return
+        if (recentDB) {
+            logger.debug(`DB HIT: ${url}`);
+            const report: ThreatReport = {
+                url: recentDB.url,
+                score: recentDB.score,
+                level: recentDB.level as ThreatReport["level"],
+                recommendation: recentDB.recommendation as ThreatReport["recommendation"],
+                mlScore: recentDB.mlScore,
+                signals: recentDB.signals as any,
+                cachedAt: recentDB.createdAt.getTime(),
+                scanDurationMs: recentDB.scanDurationMs ?? undefined,
+            };
+            // Backfill Redis so next hit is instant
+            await cacheSet(cacheKey, report);
+            res.json({ ...report, fromCache: true });
+            return;
         }
 
-        // Run full scan
-        const report = await scanUrl({ url, mlScore: mlScore ?? 0 })
+        // ── 3. Cache miss — enqueue async job ─────────────────────────────────
+        const job = await scanQueue.add("scan", {
+            url,
+            mlScore: mlScore ?? 0,
+            deviceId: req.deviceId!,
+            jobId: "", // filled below
+        });
 
-        // Persist result
-        await prisma.scanResult.create({
-            data: {
-                urlHash,
-                url,
-                score: report.score,
-                level: report.level,
-                recommendation: report.recommendation,
-                mlScore: report.mlScore,
-                signals: report.signals as any,
-                scanDurationMs: report.scanDurationMs,
-                deviceId: req.deviceId!,
-            },
-        })
+        // Update the jobId field with the real BullMQ job ID
+        await job.updateData({ ...(job.data as any), jobId: job.id! });
 
-        // Update device scan count
-        await prisma.userDevice.update({
-            where: { id: req.deviceId },
-            data: { scanCount: { increment: 1 } },
-        })
+        logger.info(`Enqueued scan job ${job.id} for ${url}`);
 
-        // If HIGH or CRITICAL — upsert into FlaggedDomain
-        if (report.score > 65) {
-            const hostname = new URL(url).hostname
-            await prisma.flaggedDomain.upsert({
-                where: { domain: hostname },
-                update: { score: report.score, reportCount: { increment: 1 }, updatedAt: new Date() },
-                create: { domain: hostname, score: report.score, reason: report.signals[0]?.detail ?? 'High risk score' },
-            })
-        }
-
-        res.json({ ...report, fromCache: false })
+        // Respond immediately — extension listens on WebSocket for the result
+        res.json({
+            status: "queued",
+            jobId: job.id,
+            message: "Scan queued — result will be pushed via WebSocket",
+        });
     } catch (err) {
-        logger.error('Scan error:', err)
-        res.status(500).json({ error: 'Scan failed', detail: err instanceof Error ? err.message : 'Unknown error' })
+        logger.error("Scan error:", err);
+        res.status(500).json({
+            error: "Scan failed",
+            detail: err instanceof Error ? err.message : "Unknown",
+        });
     }
 }
 
-export async function handleGenerateToken(req: AuthRequest, res: Response): Promise<void> {
-    // This endpoint is called by the extension on first install to get a device JWT
-    // It's the only unauthenticated endpoint
-    import('jsonwebtoken').then(({ default: jwt }) => {
-        const secret = process.env.JWT_SECRET!
-        const token = jwt.sign(
-            { type: 'device', createdAt: Date.now() },
-            secret,
-            { expiresIn: '365d' }
-        )
-        res.json({ token })
-    })
+// ─── POST /api/auth/device ────────────────────────────────────────────────────
+
+export async function handleGenerateToken(_req: AuthRequest, res: Response): Promise<void> {
+    const secret = process.env.JWT_SECRET!;
+    const token = jwt.sign({ type: "device", createdAt: Date.now() }, secret, {
+        expiresIn: "365d",
+    });
+    res.json({ token });
 }
+
+// ─── GET /api/history ─────────────────────────────────────────────────────────
 
 export async function handleGetHistory(req: AuthRequest, res: Response): Promise<void> {
     try {
         const results = await prisma.scanResult.findMany({
             where: { deviceId: req.deviceId },
-            orderBy: { createdAt: 'desc' },
+            orderBy: { createdAt: "desc" },
             take: 100,
             select: {
                 url: true,
@@ -117,10 +118,45 @@ export async function handleGetHistory(req: AuthRequest, res: Response): Promise
                 recommendation: true,
                 signals: true,
                 createdAt: true,
+                scanDurationMs: true,
             },
-        })
-        res.json({ results })
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch history' })
+        });
+        res.json({ results });
+    } catch {
+        res.status(500).json({ error: "Failed to fetch history" });
+    }
+}
+
+// ─── GET /api/stats ───────────────────────────────────────────────────────────
+
+export async function handleGetStats(req: AuthRequest, res: Response): Promise<void> {
+    try {
+        const [totalScans, threatsBlocked, avgScore] = await Promise.all([
+            prisma.scanResult.count({ where: { deviceId: req.deviceId } }),
+            prisma.scanResult.count({ where: { deviceId: req.deviceId, score: { gt: 65 } } }),
+            prisma.scanResult.aggregate({
+                where: { deviceId: req.deviceId },
+                _avg: { score: true },
+            }),
+        ]);
+
+        // Redis cache hit rate
+        const [hits, misses] = await Promise.all([
+            redis.get("stats:cache_hits"),
+            redis.get("stats:cache_misses"),
+        ]);
+        const hitCount = parseInt(hits ?? "0");
+        const missCount = parseInt(misses ?? "0");
+        const total = hitCount + missCount;
+        const hitRate = total > 0 ? Math.round((hitCount / total) * 100) : 0;
+
+        res.json({
+            totalScans,
+            threatsBlocked,
+            avgScore: Math.round(avgScore._avg.score ?? 0),
+            cacheHitRate: hitRate,
+        });
+    } catch {
+        res.status(500).json({ error: "Failed to fetch stats" });
     }
 }

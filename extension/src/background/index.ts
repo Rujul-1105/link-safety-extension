@@ -1,11 +1,105 @@
 import type { ExtMessage, ThreatReport, UserPreferences } from "../shared/types";
 import { scoreToBadgeColor, DEFAULT_PREFERENCES } from "../shared/types";
+// ─── Socket.io connection ─────────────────────────────────────────────────────
+// We load Socket.io client via dynamic import from the CDN
+// Service workers can use importScripts for this
 
+let socketConnected = false;
+
+async function connectWebSocket(deviceId: string) {
+    if (socketConnected) return;
+
+    try {
+        // Use native WebSocket — build a lightweight client manually
+        // (Socket.io client is too large for a service worker)
+        const ws = new WebSocket("ws://localhost:3001/socket.io/?transport=websocket&EIO=4");
+
+        ws.onopen = () => {
+            socketConnected = true;
+            console.log("[NetGuard BG] WebSocket connected");
+            // Socket.io handshake
+            ws.send("40"); // connect packet
+            // Identify this device
+            ws.send(`42["identify","${deviceId}"]`);
+        };
+
+        ws.onmessage = async (event) => {
+            const data = event.data as string;
+
+            // Socket.io ping — must respond with pong
+            if (data === "2") {
+                ws.send("3");
+                return;
+            }
+
+            // Parse Socket.io message format: 42["event", payload]
+            if (data.startsWith("42")) {
+                try {
+                    const [eventName, payload] = JSON.parse(data.slice(2));
+
+                    if (eventName === "threat:result" && payload?.report) {
+                        const report = payload.report as ThreatReport;
+
+                        // Cache the result locally
+                        await cacheReport(report.url, report);
+
+                        // Find the exact tab that requested this scan
+                        const tabId = scanTabs.get(report.url);
+                        if (tabId) {
+                            await updateBadge(tabId, report.score);
+                            scanTabs.delete(report.url);
+                        } else {
+                            // Fallback if tab mapping was lost
+                            const tabs = await chrome.tabs.query({});
+                            const matchingTab = tabs.find((t) => t.url && (t.url === report.url || t.url.startsWith(report.url)));
+                            if (matchingTab?.id) {
+                                await updateBadge(matchingTab.id, report.score);
+                            }
+                        }
+
+                        // Push to popup if open
+                        chrome.runtime
+                            .sendMessage({ type: "THREAT_RESULT", payload: report })
+                            .catch(() => {});
+
+                        // Notification for high risk
+                        const prefs = await getPreferences();
+                        if (report.score > 60 && prefs.notifications) {
+                            chrome.notifications.create({
+                                type: "basic",
+                                iconUrl: "icons/icon48.png",
+                                title: `⚠️ NetGuard — ${report.level} Risk`,
+                                message: `Score: ${report.score}/100\n${report.url.slice(0, 80)}`,
+                            });
+                        }
+                    }
+                } catch {
+                    /* non-JSON message, ignore */
+                }
+            }
+        };
+
+        ws.onclose = () => {
+            socketConnected = false;
+            console.log("[NetGuard BG] WebSocket disconnected — will reconnect on next scan");
+        };
+
+        ws.onerror = (err) => {
+            console.warn("[NetGuard BG] WebSocket error:", err);
+            socketConnected = false;
+        };
+    } catch (err) {
+        console.warn("[NetGuard BG] WebSocket setup failed:", err);
+    }
+}
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────
 // Add at top of background/index.ts
 const API_BASE = "http://localhost:3001/api";
+
+// Map to track which tab requested which URL
+const scanTabs = new Map<string, number>();
 
 async function getOrCreateDeviceToken(): Promise<string> {
     const stored = await chrome.storage.local.get("device_token");
@@ -18,10 +112,14 @@ async function getOrCreateDeviceToken(): Promise<string> {
     return token;
 }
 
-async function performAPIScan(url: string, mlScore = 0): Promise<ThreatReport> {
-    const token = await getOrCreateDeviceToken();
+async function performAPIScan(url: string, mlScore = 0): Promise<ThreatReport | null> {
+    let token = await getOrCreateDeviceToken();
 
-    const res = await fetch(`${API_BASE}/scan`, {
+    // Ensure WebSocket is connected so we receive the pushed result
+    let tokenHash = btoa(token).slice(0, 16); // rough device ID for WS identification
+    await connectWebSocket(tokenHash);
+
+    let res = await fetch(`${API_BASE}/scan`, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -30,12 +128,38 @@ async function performAPIScan(url: string, mlScore = 0): Promise<ThreatReport> {
         body: JSON.stringify({ url, mlScore }),
     });
 
+    if (res.status === 401) {
+        console.log("[NetGuard BG] Token expired/invalid, getting a new one...");
+        await chrome.storage.local.remove("device_token");
+        token = await getOrCreateDeviceToken();
+        tokenHash = btoa(token).slice(0, 16);
+        await connectWebSocket(tokenHash);
+
+        res = await fetch(`${API_BASE}/scan`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ url, mlScore }),
+        });
+    }
+
     if (!res.ok) {
-        const err = await res.json();
+        const err = await res.json().catch(() => ({ error: `API error ${res.status}` }));
         throw new Error(err.error ?? `API error ${res.status}`);
     }
 
-    return res.json();
+    const data = await res.json();
+
+    // Cache hit — result came back immediately
+    if (data.fromCache) {
+        return data as ThreatReport;
+    }
+
+    // Queued — result will arrive via WebSocket (threat:result event)
+    // Return null to signal "scan is in flight"
+    return null;
 }
 async function getCachedReport(url: string): Promise<ThreatReport | null> {
     const key = `scan_${btoa(url).replace(/[^a-zA-Z0-9]/g, "_")}`;
@@ -62,7 +186,7 @@ async function cacheReport(url: string, report: ThreatReport): Promise<void> {
 
 async function updateBadge(tabId: number, score: number) {
     const color = scoreToBadgeColor(score);
-    const text = score === 0 ? "" : String(score);
+    const text = String(score); // Always show the score, even if 0
 
     await chrome.action.setBadgeBackgroundColor({ color, tabId });
     await chrome.action.setBadgeText({ text, tabId });
@@ -133,6 +257,9 @@ chrome.runtime.onMessage.addListener((message: ExtMessage, sender, sendResponse)
 
             console.log(`[NetGuard BG] Scanning: ${url}`);
 
+            // Track tab for WebSocket response
+            scanTabs.set(url, tabId);
+
             // 1. Show scanning badge immediately
             await setBadgeScanning(tabId);
 
@@ -148,9 +275,14 @@ chrome.runtime.onMessage.addListener((message: ExtMessage, sender, sendResponse)
             // 3. Cache miss — run scan (mock for now, real API on Day 3)
             try {
                 const report = await performAPIScan(url);
+                if (report === null) {
+                    // Job is queued — WebSocket will push the result when done
+                    // Badge stays on scanning state until the push arrives
+                    sendResponse({ status: "queued" });
+                    return;
+                }
                 await cacheReport(url, report);
                 await updateBadge(tabId, report.score);
-
                 // 4. If popup is open, push the result to it
                 chrome.runtime.sendMessage({ type: "THREAT_RESULT", payload: report }).catch(() => {
                     // Popup not open — that's fine

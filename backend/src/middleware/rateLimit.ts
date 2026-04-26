@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 
 // Per-IP: 100 requests per 15 minutes
 export const globalRateLimit = rateLimit({
@@ -16,8 +16,9 @@ export const scanRateLimit = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Scan rate limit exceeded' },
-    keyGenerator: (req) => {
+    keyGenerator: (req, res) => {
         // Key by IP + device token combo for better granularity
-        return req.ip + (req.headers.authorization ?? '')
+        const ip = req.ip ?? req.socket.remoteAddress ?? '';
+        return ipKeyGenerator(ip) + '_' + (req.headers.authorization ?? '')
     },
 })

@@ -258,6 +258,59 @@ function checkURLHeuristics(url: string): ThreatSignal {
     return { name: 'URL Heuristics', score: Math.min(score, 40), detail, category: 'ml' }
 }
 
+// ─── Check 6: VirusTotal API ───────────────────────────────────────────────────
+
+async function checkVirusTotal(url: string): Promise<ThreatSignal> {
+    const apiKey = process.env.VIRUSTOTAL_API_KEY
+    if (!apiKey) {
+        return { name: 'VirusTotal', score: 0, detail: 'VirusTotal API key not configured', category: 'networking' }
+    }
+
+    try {
+        // Encode URL to base64url for VT API v3
+        const urlId = Buffer.from(url).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_')
+        const vtUrl = `https://www.virustotal.com/api/v3/urls/${urlId}`
+        
+        const res = await fetchWithTimeout(vtUrl, 8000)
+
+        if (res.status === 404) {
+            return { name: 'VirusTotal', score: 0, detail: 'No previous scans found on VirusTotal', category: 'networking' }
+        }
+
+        if (!res.ok) throw new Error(`VT API ${res.status}`)
+
+        const data = await res.json() as any
+        const stats = data.data?.attributes?.last_analysis_stats
+        
+        if (!stats) throw new Error('Missing stats')
+
+        const malicious = stats.malicious || 0
+        const suspicious = stats.suspicious || 0
+
+        let score = 0
+        let detail = `VirusTotal: ${malicious} malicious, ${suspicious} suspicious`
+
+        if (malicious > 3) {
+            score = 60
+            detail = `CRITICAL: Flagged by ${malicious} security engines on VirusTotal`
+        } else if (malicious > 0) {
+            score = 40
+            detail = `Flagged by ${malicious} security engine(s) on VirusTotal`
+        } else if (suspicious > 0) {
+            score = 20
+            detail = `Flagged as suspicious by ${suspicious} engine(s) on VirusTotal`
+        } else {
+            score = 0
+            detail = `Clean on VirusTotal (0 engines flagged)`
+        }
+
+        return { name: 'VirusTotal', score, detail, category: 'networking' }
+    } catch (err) {
+        logger.debug('VirusTotal check failed:', err)
+        return { name: 'VirusTotal', score: 0, detail: 'VirusTotal check unavailable', category: 'networking' }
+    }
+}
+
 // ─── Ensemble Scorer ─────────────────────────────────────────────────────────
 
 function computeEnsembleScore(
@@ -268,14 +321,18 @@ function computeEnsembleScore(
     const networkingSignals = signals.filter(s => s.category === 'networking' || s.category === 'headers')
     const rawNetworkScore = networkingSignals.reduce((sum, s) => sum + s.score, 0)
 
+    const heuristicsSignal = signals.find(s => s.name === 'URL Heuristics')
+    const heuristicsScore = heuristicsSignal ? heuristicsSignal.score : 0
+
     // ML score contribution (0-1 from ONNX, scaled to 0-40)
-    const mlContribution = mlScore * 40
+    // Fall back to URL heuristics if ML score is 0
+    const mlContribution = mlScore > 0 ? (mlScore * 40) : heuristicsScore
 
     // Network contribution capped at 60
     const networkContribution = Math.min(rawNetworkScore, 60)
 
-    // Weighted ensemble
-    const raw = mlContribution * 0.4 + networkContribution * 0.6
+    // Add them directly since they are already scaled to parts of 100 (40 + 60)
+    const raw = mlContribution + networkContribution
 
     return Math.min(Math.round(raw), 100)
 }
@@ -296,17 +353,18 @@ export async function scanUrl(request: ScanRequest): Promise<ThreatReport> {
     logger.info(`Scanning: ${hostname}`)
 
     // Run all checks in parallel — total time = slowest check (~400-600ms)
-    const [domainAge, tlsCert, doh, headers] = await Promise.all([
+    const [domainAge, tlsCert, doh, headers, vt] = await Promise.all([
         checkDomainAge(hostname),
         checkTLSCert(hostname),
         checkDoH(hostname),
         checkHeaders(url),
+        checkVirusTotal(url)
     ])
 
     // URL heuristics is synchronous — runs instantly
     const heuristics = checkURLHeuristics(url)
 
-    const signals = [domainAge, tlsCert, doh, headers, heuristics]
+    const signals = [domainAge, tlsCert, doh, headers, vt, heuristics]
         .filter(s => s.score > 0)  // only include signals that found something
 
     const score = computeEnsembleScore(signals, mlScore)

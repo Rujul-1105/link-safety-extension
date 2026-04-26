@@ -1,23 +1,24 @@
-import { Router } from 'express'
-import { authMiddleware } from '../middleware/auth'
-import { scanRateLimit } from '../middleware/rateLimit'
-import { handleScan, handleGenerateToken, handleGetHistory } from '../controllers/scan.controller'
+import { Router } from "express";
+import { authMiddleware } from "../middleware/auth";
+import { scanRateLimit } from "../middleware/rateLimit";
+import {
+    handleScan,
+    handleGenerateToken,
+    handleGetHistory,
+    handleGetStats,
+} from "../controllers/scan.controller";
 
-const router = Router()
+const router = Router();
 
-// Public — no auth needed
-// Extension calls this once on first install to get its device token
-router.post('/auth/device', handleGenerateToken)
+// ── Public ────────────────────────────────────────────────────────────────────
+router.post("/auth/device", handleGenerateToken);
+router.get("/health", (_, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-// Health check
-router.get('/health', (_, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() })
-})
+// ── Protected ─────────────────────────────────────────────────────────────────
+router.use(authMiddleware);
 
-// Protected routes — require JWT
-router.use(authMiddleware)
+router.post("/scan", scanRateLimit, handleScan);
+router.get("/history", handleGetHistory);
+router.get("/stats", handleGetStats);
 
-router.post('/scan', scanRateLimit, handleScan)
-router.get('/history', handleGetHistory)
-
-export default router
+export default router;
